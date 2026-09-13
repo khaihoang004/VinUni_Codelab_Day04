@@ -1,200 +1,189 @@
-"""
-Lab #4: System Prompt Engineering & Tool Calling Engine
-Học viên hoàn thiện các mục TODO để hoàn thành bài lab.
-
-Kiến trúc:
-  - ChatbotBaseline: LLM thuần, không dùng tool → quan sát hallucination.
-  - ToolCallingAgent: Agent dùng System Prompt + 2 Tool Schemas.
-"""
-
+import os
 import json
 import re
-import os
 from typing import Dict, Any, List
+
 from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TODO 1: Thiết kế SYSTEM PROMPT cấp sản xuất
-# Yêu cầu: Phải chứa Persona, Core Rules, Operational Boundaries, Output Contract.
-# ═══════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """
-Bạn là VinAssistant, trợ lý chăm sóc khách hàng chính thức của Vingroup.
+Bạn là VinAssistant — trợ lý AI chính thức của hệ sinh thái Vingroup.
 
-## PERSONA
-- Vai trò: tư vấn sản phẩm/dịch vụ Vingroup và tiếp nhận yêu cầu hỗ trợ.
-- Giọng điệu: lịch sự, thân thiện, ngắn gọn, trả lời bằng tiếng Việt.
+## 1. PERSONA
+- Tên: VinAssistant
+- Vai trò: Chuyên viên tư vấn sản phẩm, dịch vụ và hỗ trợ kỹ thuật khách hàng của Vingroup.
+- Giọng điệu: Chuyên nghiệp, thân thiện, chính xác và đáng tin cậy.
 
-## AVAILABLE TOOLS
+## 2. AVAILABLE TOOLS
+Bạn có quyền truy cập vào các công cụ sau:
 {tools}
 
-## CORE RULES
-1. Không bịa tên sản phẩm, giá, tình trạng đơn hàng, mã ticket hoặc chính sách.
-2. Khi người dùng hỏi sản phẩm/dịch vụ theo danh mục hoặc giá, phải gọi
-   `search_product_catalog` trước khi trả lời.
-3. Khi người dùng yêu cầu hỗ trợ, khiếu nại hoặc báo lỗi và đã có tên cùng mô tả
-   vấn đề, phải gọi `submit_support_ticket`.
-4. Nếu thiếu thông tin bắt buộc để tạo ticket, hãy hỏi lại thay vì tạo ticket.
-5. Chỉ dùng dữ liệu từ Observation của tool để nêu kết quả.
+## 3. CORE RULES
+- KHÔNG BAO GIỜ tự bịa đặt (hallucinate) thông tin, giá cả, thông số sản phẩm hoặc trạng thái đơn hàng.
+- BẮT BUỘC phải gọi tool để lấy dữ liệu thực tế trước khi trả lời các câu hỏi về sản phẩm, dịch vụ hoặc xử lý yêu cầu hỗ trợ.
+- Chỉ trả lời dựa trên dữ liệu thực tế nhận được từ Observation. Nếu tool báo lỗi hoặc không tìm thấy kết quả, hãy thông báo trung thực với khách hàng.
 
-## OPERATIONAL BOUNDARIES
-- Chỉ hỗ trợ các sản phẩm, dịch vụ và yêu cầu thuộc hệ sinh thái Vingroup.
-- Không tư vấn tài chính, pháp lý, y tế hoặc tiết lộ dữ liệu cá nhân.
+## 4. OPERATIONAL BOUNDARIES
+- Phạm vi hoạt động: Chỉ giải đáp và hỗ trợ các vấn đề liên quan đến hệ sinh thái Vingroup (VinFast, Vinhomes, Vinmec, Vinpearl, v.v.).
+- Nếu người dùng hỏi các chủ đề ngoài phạm vi (ví dụ: xe của hãng khác, chính trị, v.v.), hãy từ chối lịch sự và cho biết bạn chỉ hỗ trợ dịch vụ của Vingroup.
 
-## OUTPUT CONTRACT
-Suy luận nội bộ theo đúng một trong các mẫu sau, không bọc JSON trong Markdown:
-Thought: <lý do ngắn>
-Action: {{"name": "tool_name", "args": {{}}}}
+## 5. OUTPUT CONTRACT (ReAct Format)
+Bạn BẮT BUỘC phải suy nghĩ và hành động theo định dạng chính xác sau đây. Vòng lặp Thought/Action/Action Input/Observation có thể lặp lại nhiều lần cho đến khi bạn có đủ thông tin.
 
-Sau khi có kết quả tool:
-Thought: <lý do ngắn>
-Final Answer: <câu trả lời cho khách hàng>
-""".strip()
-
-
+Thought: Suy nghĩ của bạn về những gì người dùng đang hỏi và bạn cần làm gì tiếp theo.
+Action: Tên của công cụ cần gọi (chọn 1 trong các tool được cung cấp). Nếu không cần tool hoặc đã đủ thông tin, ghi "None".
+Action Input: Tham số truyền vào tool dưới dạng JSON hợp lệ (ví dụ: {{"category": "xe_dien", "max_price": 600000000}}).
+Observation: Kết quả trả về từ hệ thống (BẠN KHÔNG ĐƯỢC TỰ VIẾT PHẦN NÀY, hệ thống sẽ điền).
+... (lặp lại Thought/Action/Action Input/Observation nếu cần)
+Thought: Tôi đã có đủ thông tin để trả lời.
+Final Answer: Câu trả lời cuối cùng gửi đến người dùng bằng ngôn ngữ tự nhiên, mạch lạc.
+"""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLASS: ChatbotBaseline
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ChatbotBaseline:
-    """Baseline LLM Chatbot — Không sử dụng Tool Calling hay ReAct Loop."""
+    """Baseline LLM Chatbot — Không sử dụng Tool Calling hay ReAct.
+    Mục đích: So sánh chất lượng trả lời khi LLM bịa thông tin (hallucination).
+    """
+
+    def __init__(self, api_key: str = None, model_name: str = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.model_name = model_name or os.getenv("MODEL_NAME")
+        if self.api_key:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(self.model_name)
+        else:
+            self.model = None
 
     def query(self, user_input: str) -> Dict[str, Any]:
-        # TODO 2: Trả về câu trả lời tĩnh (mock) hoặc gọi Gemini API 1 lượt (không dùng tool)
-        # Mục tiêu: Quan sát hiện tượng bịa thông tin (hallucination)
+        """Gửi câu hỏi tới LLM (hoặc trả lời mock nếu không có API Key)."""
+        if self.model:
+            try:
+                prompt = f"Bạn là trợ lý AI. Hãy trả lời câu hỏi sau: {user_input}"
+                response = self.model.generate_content(prompt)
+                answer = response.text
+            except Exception as e:
+                answer = f"[Lỗi gọi API]: {str(e)}"
+        else:
+            answer = f"[Chatbot Baseline Mock] Trả lời ảo cho: {user_input} (Cần cấu hình GEMINI_API_KEY)"
+
         return {
-            "answer": f"[Chatbot Baseline] Trả lời cho: {user_input}",
+            "answer": answer,
             "tool_calls": [],
             "status": "success",
-            "mode": "mock_baseline"
+            "mode": "baseline"
         }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLASS: ToolCallingAgent
-# ═══════════════════════════════════════════════════════════════════════════
-
-class ChatbotAgent():
-    def __init__(self, api_key: str = None, model: str = None):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.model_name = model or os.getenv("LLM_MODEL") or "gemini-3.1-flash-lite"
-
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        if not self.api_key or self.api_key == "your_gemini_api_key_here":
-            return "[Gemini Error]: Chưa cấu hình GEMINI_API_KEY trong file .env! Đang sử dụng chế độ Mock."
-        try:
-            from google import genai
-            client = genai.Client(api_key=self.api_key)
-            contents = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-            response = client.models.generate_content(model=self.model_name, contents=contents)
-            return response.text
-        except Exception as e:
-            return f"[Gemini Exception]: {str(e)}"
-
-    def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
-        if not self.api_key or self.api_key == "your_gemini_api_key_here":
-            print("ℹ️ [Gemini Provider]: Chưa tìm thấy GEMINI_API_KEY hợp lệ. Tự động chuyển sang Mock Offline.")
-        
-        try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(api_key=self.api_key)
-            
-            function_declarations = []
-            for tool in tools_schema:
-                if not tool.get("name") or not tool.get("parameters"):
-                    continue
-                function_declarations.append({
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {})
-                })
-
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt if system_prompt else None,
-                tools=[{"function_declarations": function_declarations}] if function_declarations else None,
-                temperature=0.2
-            )
-
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config
-            )
-
-            if response.function_calls:
-                call = response.function_calls[0]
-                args = dict(call.args) if hasattr(call, 'args') and call.args else {}
-                return {
-                    "type": "tool_call",
-                    "tool_name": call.name,
-                    "arguments": args,
-                    "thought": f"Gemini quyết định gọi công cụ '{call.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
-                }
-            else:
-                return {
-                    "type": "text",
-                    "content": response.text or "",
-                    "thought": "Gemini phản hồi trực tiếp bằng văn bản (không cần gọi công cụ)."
-                }
-
-        except Exception as e:
-            print(f"[Gemini API Warning]: Không thể kết nối live API ({str(e)}). Tự động fallback về Mock.")
-
 
 class ToolCallingAgent:
-    """Agent với System Prompt Engineering & Tool Calling."""
+    """Agent với System Prompt Engineering & Tool Calling (ReAct Loop)."""
 
-    def __init__(self, max_iterations: int = 5):
+    def __init__(self, max_iterations: int = 5, api_key: str = None, model_name: str = None):
         self.max_iterations = max_iterations
-        self.api_key = os.getenv("GEMINI_API_KEY", "No API key")
         self.trace: List[Dict[str, Any]] = []
-        
-        from genai
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.model_name = model_name or os.getenv("MODEL_NAME")
+
+        if self.api_key:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(self.model_name)
+        else:
+            self.model = None
 
     def run(self, user_input: str) -> Dict[str, Any]:
-        """Điểm vào chính — chạy Agent Loop."""
+        """Điểm vào chính — chạy ReAct Agent Loop."""
         self.trace = []
-
-        response = 
-        # TODO 3: Phân tích intent từ user_input
-        #   - Xác định cần gọi tool nào (catalog? ticket? cả hai? FAQ?)
-        #   - Gợi ý: Dùng keyword matching hoặc regex
-
-        # TODO 4: Xây dựng Agent Loop (while iteration <= self.max_iterations)
-        #   - Iteration 1: Gọi tool #1 nếu cần (search_product_catalog)
-        #   - Iteration 2: Gọi tool #2 nếu cần (submit_support_ticket)
-        #   - Iteration 3+: Tổng hợp Final Answer từ trace
-        #   - Lưu mỗi bước vào self.trace
-
-        # Skeleton return
         self.trace.append({"step": "init", "user_input": user_input})
+        
+        if not self.model:
+            return {
+                "answer": "[Lỗi] Không tìm thấy GEMINI_API_KEY. Vui lòng cấu hình biến môi trường.",
+                "trace": self.trace,
+                "iterations": 0,
+                "status": "error"
+            }
+            
+        tools_str = json.dumps(TOOL_DEFINITIONS, indent=2, ensure_ascii=False)
+
+        current_prompt = SYSTEM_PROMPT.format(tools=tools_str) + f"\nUser: {user_input}\n"
+        
+        for iteration in range(1, self.max_iterations + 1):
+            try:
+                response = self.model.generate_content(current_prompt)
+                llm_output = response.text
+                self.trace.append({"step": f"llm_output_iter_{iteration}", "content": llm_output})
+                
+                current_prompt += llm_output + "\n"
+
+                final_answer_match = re.search(r"Final Answer:\s*(.*)", llm_output, re.DOTALL)
+                if final_answer_match:
+                    return {
+                        "answer": final_answer_match.group(1).strip(),
+                        "trace": self.trace,
+                        "iterations": iteration,
+                        "status": "success"
+                    }
+
+                action_match = re.search(r"Action:\s*(.+)", llm_output)
+                action_input_match = re.search(r"Action Input:\s*(.+)", llm_output, re.DOTALL)
+
+                if action_match and action_input_match:
+                    action_name = action_match.group(1).strip()
+                    action_input_str = action_input_match.group(1).strip()
+                    
+                    action_input_str = re.sub(r"^```json|```$", "", action_input_str).strip()
+                    
+                    try:
+                        action_args = json.loads(action_input_str)
+                    except json.JSONDecodeError:
+                        observation = "Error: Action Input không phải là JSON hợp lệ."
+                        current_prompt += f"Observation: {observation}\n"
+                        self.trace.append({"step": f"tool_error_iter_{iteration}", "error": observation})
+                        continue
+
+                    self.trace.append({"step": f"tool_execution_iter_{iteration}", "tool": action_name, "args": action_args})
+                    
+                    if action_name in TOOL_MAP:
+                        tool_result = TOOL_MAP[action_name](**action_args)
+                        observation = str(tool_result)
+                    else:
+                        observation = f"Error: Tool '{action_name}' không tồn tại."
+
+                    current_prompt += f"Observation: {observation}\n"
+                    self.trace.append({"step": f"observation_iter_{iteration}", "content": observation})
+                else:
+                    current_prompt += "Observation: Format không hợp lệ. Vui lòng sử dụng đúng định dạng Thought/Action/Action Input hoặc Final Answer.\n"
+
+            except Exception as e:
+                self.trace.append({"step": f"error_iter_{iteration}", "error": str(e)})
+                break
+
         return {
-            "answer": "TODO: Implement ToolCallingAgent loop",
+            "answer": "Không thể tìm ra câu trả lời sau số lần lặp tối đa.",
             "trace": self.trace,
-            "iterations": 0,
-            "status": "not_implemented"
+            "iterations": self.max_iterations,
+            "status": "max_iterations_reached"
         }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN — Chạy thử nhanh
-# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     user_query = "Tôi muốn xem xe điện VinFast giá dưới 600 triệu."
 
     print("=== RUNNING CHATBOT BASELINE ===")
     chatbot = ChatbotBaseline()
-    print(chatbot.query(user_query))
+    baseline_result = chatbot.query(user_query)
+    print("Baseline Answer:\n", baseline_result["answer"])
+    print("-" * 50)
 
-    print("\n=== RUNNING TOOL CALLING AGENT ===")
+    print("\n=== RUNNING TOOL CALLING AGENT (ReAct) ===")
     agent = ToolCallingAgent(max_iterations=5)
-    result = agent.run(user_query)
-    print("Result:", result["answer"])
-    print("Trace Log:", json.dumps(agent.trace, indent=2, ensure_ascii=False))
+    agent_result = agent.run(user_query)
+    print("Agent Final Answer:\n", agent_result["answer"])
+    
+    print("\n=== TRACE LOG ===")
+    print(json.dumps(agent_result["trace"], indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
