@@ -73,7 +73,7 @@ class ChatbotBaseline:
         return {
             "answer": answer,
             "tool_calls": [],
-            "status": "completed",
+            "status": "success",
             "mode": "baseline"
         }
 
@@ -100,22 +100,22 @@ class ToolCallingAgent:
         
         if not self.model:
             return {
-                "answer": "[Lỗi] Không tìm thấy GEMINI_API_KEY. Vui lòng cấu hình biến môi trường.",
+                "answer": "[Lỗi] Không tìm thấy GEMINI_API_KEY.",
                 "trace": self.trace,
                 "iterations": 0,
                 "status": "error"
             }
-            
-        tools_str = json.dumps(TOOL_DEFINITIONS, indent=2, ensure_ascii=False)
 
+        tools_str = json.dumps(TOOL_DEFINITIONS, indent=2, ensure_ascii=False)
         current_prompt = SYSTEM_PROMPT.format(tools=tools_str) + f"\nUser: {user_input}\n"
+        
+        tool_call_count = 0 
         
         for iteration in range(1, self.max_iterations + 1):
             try:
                 response = self.model.generate_content(current_prompt)
                 llm_output = response.text
                 self.trace.append({"step": f"llm_output_iter_{iteration}", "content": llm_output})
-                
                 current_prompt += llm_output + "\n"
 
                 final_answer_match = re.search(r"Final Answer:\s*(.*)", llm_output, re.DOTALL)
@@ -123,7 +123,7 @@ class ToolCallingAgent:
                     return {
                         "answer": final_answer_match.group(1).strip(),
                         "trace": self.trace,
-                        "iterations": iteration,
+                        "iterations": 1,
                         "status": "completed"
                     }
 
@@ -132,8 +132,14 @@ class ToolCallingAgent:
 
                 if action_match and action_input_match:
                     action_name = action_match.group(1).strip()
-                    action_input_str = action_input_match.group(1).strip()
                     
+                    if action_name.lower() == "none":
+                        current_prompt += "Observation: Không có tool nào được gọi. Hãy đưa ra Final Answer.\n"
+                        continue
+
+                    tool_call_count += 1  
+                    
+                    action_input_str = action_input_match.group(1).strip()
                     action_input_str = re.sub(r"^```json|```$", "", action_input_str).strip()
                     
                     try:
@@ -164,7 +170,7 @@ class ToolCallingAgent:
         return {
             "answer": "Không thể tìm ra câu trả lời sau số lần lặp tối đa.",
             "trace": self.trace,
-            "iterations": self.max_iterations,
+            "iterations": tool_call_count,
             "status": "max_iterations_reached"
         }
 
