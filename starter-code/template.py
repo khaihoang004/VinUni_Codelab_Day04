@@ -73,7 +73,7 @@ class ChatbotBaseline:
         return {
             "answer": answer,
             "tool_calls": [],
-            "status": "success",
+            "status": "completed",
             "mode": "baseline"
         }
 
@@ -124,7 +124,7 @@ class ToolCallingAgent:
                         "answer": final_answer_match.group(1).strip(),
                         "trace": self.trace,
                         "iterations": iteration,
-                        "status": "success"
+                        "status": "completed"
                     }
 
                 action_match = re.search(r"Action:\s*(.+)", llm_output)
@@ -178,7 +178,7 @@ def main():
     print("-" * 50)
 
     print("\n=== RUNNING TOOL CALLING AGENT (ReAct) ===")
-    agent = ToolCallingAgent(max_iterations=5)
+    agent = ToolCallingAgent(max_iterations=5, model_name="gemini-3.5-flash-lite")
     agent_result = agent.run(user_query)
     print("Agent Final Answer:\n", agent_result["answer"])
     
